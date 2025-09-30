@@ -23,7 +23,6 @@ build/
 
 # Environment
 .env
-.env.*
 
 # Data & Indexes
 data/index/*.faiss
