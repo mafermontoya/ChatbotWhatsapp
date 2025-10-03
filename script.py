@@ -1,6 +1,6 @@
-import os
+import os,hmac, hashlib
 import logging
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, request,jsonify
 from dotenv import load_dotenv
 import google.generativeai as genai
 import json
@@ -12,6 +12,7 @@ import asyncio
 import time
 from functools import wraps
 from message_splitter import split_message
+
 
 # === RAG utilidades ===
 import faiss
@@ -54,7 +55,10 @@ def retrieve_context(query: str, k: int = 5) -> str:
         if int(idx) < 0:
             continue
         item = docstore[int(idx)]
-        parts.append(f"[{item['file']} · pág {item.get('page','?')} · chunk {item['chunk_id']}]\n{item['text']}")
+        # Formato más humano para el contexto interno
+        filename = item['file'].replace('.pdf', '').replace('-', ' ')
+        page = item.get('page', '?')
+        parts.append(f"Documento: {filename}, página {page}\nContenido: {item['text']}")
     return "\n\n---\n\n".join(parts)
 
 
@@ -344,12 +348,30 @@ class GeminiClient:
 
         try:
             retrieved = retrieve_context(message_text, k=5)
+            
+            # Si no hay contexto relevante, respuesta estricta con sugerencias
+            if not retrieved.strip():
+                return ("Lo siento, no tengo esa información en mi base de datos. "
+                       "Puedo ayudarte con cosas como: información sobre el menú semanal día a día, "
+                       "desayunos, comidas y cenas para cada día de la semana. "
+                       "¿Te gustaría saber algo sobre el menú?")
+            
             rag_guardrails = (
-                "Responde ÚNICAMENTE con base en el contexto documental provisto.\n"
-                "Si no está en el contexto, responde: \"No encontré esa información en mis documentos.\" "
-                "y sugiere términos/secciones a buscar.\n\n"
-                f"Contexto documental:\n{retrieved if retrieved else '[Vacío]'}\n\n"
-                "Estilo: respuesta breve apta para WhatsApp; si procede, incluye referencia [archivo · pág · chunk]."
+                "INSTRUCCIONES ESTRICTAS:\n"
+                "1. SIEMPRE empieza tu respuesta mencionando la fuente: 'Según el documento [nombre-archivo] en la página [X]:'\n"
+                "2. Responde ÚNICAMENTE con información del contexto documental provisto\n"
+                "3. Si la pregunta NO se puede responder con el contexto, responde: 'Lo siento, no tengo esa información en mi base de datos. Puedo ayudarte con información sobre el menú semanal día a día, desayunos, comidas y cenas para cada día de la semana. ¿Te gustaría saber algo sobre el menú?'\n"
+                "4. NO incluyas referencias técnicas como [chunk X] - hazlo conversacional\n"
+                "5. Sé amigable y útil, como un asistente humano\n"
+            
+                "6. No inventes información ni detalles no presentes en el contexto\n"
+                "7. Contesta en UN solo mensaje, no dividas la respuesta en múltiples mensajes\n"
+                "8. FORMATO OBLIGATORIO: Siempre inicia con la referencia del documento y página\n\n"
+                f"Contexto documental disponible:\n{retrieved}\n\n"
+                "EJEMPLO de respuesta correcta:\n"
+                "'Según el documento menú-semanal-día-a-día en la página 3: El desayuno del lunes incluye...'\n"
+                "Responde siguiendo este formato SIEMPRE."
+                "9. Inmediatemente al recibir el mensaje de un usuario envia un mensaje de espera si el mensaje es largo o complejo (más de 20 caracteres)"
             )
             # Create model with system instruction for persona
             model = genai.GenerativeModel(
@@ -472,72 +494,97 @@ def send_whatsapp_message(recipient_number, message_content, message_type='text'
         logger.error(f"An unexpected error occurred while sending WhatsApp message: {e}")
         return False
 
+def _verify_signature(secret: str, raw_body: bytes, header_sig: str) -> bool:
+    if not secret:
+        return True  # si no configuras secret, no validamos
+    if not header_sig:
+        return False
+    
+    # Calcular firma esperada
+    computed = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    
+    # WaSenderAPI puede enviar con prefijo "sha256="
+    if header_sig.startswith('sha256='):
+        header_sig = header_sig[7:]  # Quitar "sha256="
+    
+    return hmac.compare_digest(computed, header_sig)
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Handles incoming WhatsApp messages via webhook using the WaSenderAPI SDK."""
-    try:        
-        if not wasender_client:
-            logger.error("WaSender API client is not initialized. Cannot process webhook.")
-            return jsonify({'status': 'error', 'message': 'WaSender client not initialized'}), 500
+    try:
+        raw = request.get_data()
+        data = request.get_json(silent=True) or {}
+        event = data.get('event')
 
-        data = request.json
-        if data.get('event') == 'messages.upsert' and data.get('data') and data['data'].get('messages'):
-                message_info = data['data']['messages']
-                
-                # Check if it's a message sent by the bot itself
-                if message_info.get('key', {}).get('fromMe'):
-                    logger.info(f"Ignoring self-sent message: {message_info.get('key', {}).get('id')}")
-                    return jsonify({'status': 'success', 'message': 'Self-sent message ignored'}), 200
-
-                sender_number = message_info.get('key', {}).get('remoteJid')
-                
-                incoming_message_text = None
-                message_type = 'unknown'
-
-                # Extract message content based on message structure
-                if message_info.get('message'):
-                    msg_content_obj = message_info['message']
-                    if 'conversation' in msg_content_obj:
-                        incoming_message_text = msg_content_obj['conversation']
-                        message_type = 'text'
-                    elif 'extendedTextMessage' in msg_content_obj and 'text' in msg_content_obj['extendedTextMessage']:
-                        incoming_message_text = msg_content_obj['extendedTextMessage']['text']
-                        message_type = 'text'
-
-                if not sender_number:
-                    logger.warning("Webhook received message without sender information.")
-                    return jsonify({'status': 'error', 'message': 'Incomplete sender data'}), 400
-
-                safe_sender_id = "".join(c if c.isalnum() else '_' for c in sender_number)
-                
-                # we should do this in queue in production if we take too long to respond the request will timeout
-                if message_type == 'text' and incoming_message_text:
-                    conversation_history = load_conversation_history(safe_sender_id)
-                    gemini_reply = get_gemini_response(incoming_message_text, conversation_history)
-                    
-                    if gemini_reply:
-                        message_chunks = split_message(gemini_reply)
-                        print(f"Sending {len(message_chunks)} message chunks to {sender_number}")
-                        for i, chunk in enumerate(message_chunks):
-                            if not send_whatsapp_message(sender_number, chunk, message_type='text'):
-                                logger.error(f"Failed to send message chunk to {sender_number}")
-                                break
-                            # Delay between messages
-                            import random
-                            import time
-                            if i < len(message_chunks) - 1:
-                                delay = random.uniform(5, 7)
-                                time.sleep(delay)
-                        
-                        # Save conversation history
-                        conversation_manager.add_exchange(safe_sender_id, incoming_message_text, gemini_reply)
+        # 1) Acepta SIEMPRE el test del panel (antes de cualquier otra validación)
+        if event == 'webhook.test':
+            secret = os.getenv('WEBHOOK_SECRET', '')
+            header_sig = request.headers.get('X-Webhook-Signature', '')
             
-                return jsonify({'status': 'success'}), 200
+            # Log para debugging
+            logger.info(f"Webhook test - Secret configured: {bool(secret)}")
+            logger.info(f"Webhook test - Header signature: {header_sig[:20] if header_sig else 'None'}...")
             
-    except Exception as e:
-        logger.error(f"Error processing webhook: {e}")
+            if secret and not _verify_signature(secret, raw, header_sig):
+                logger.warning("Webhook signature verification failed")
+                return jsonify({'status': 'error', 'message': 'invalid signature'}), 401
+            return jsonify({'ok': True, 'echo': 'webhook.test received'}), 200
+
+        # 2) Procesar mensajes entrantes de WhatsApp
+        if event == 'messages.received':
+            # Extraer datos del webhook según estructura real de WaSenderAPI
+            message_data = data.get('data', {})
+            messages = message_data.get('messages', {})
+            
+            # Obtener texto del mensaje
+            message_obj = messages.get('message', {})
+            message_text = message_obj.get('conversation', '').strip()
+            
+            # Obtener número del remitente
+            key_data = messages.get('key', {})
+            from_number = key_data.get('remoteJid', '').strip()
+            
+            logger.info(f"Mensaje recibido de '{from_number}': '{message_text}'")
+            
+            # Validar que tengamos datos válidos
+            if not message_text or not from_number:
+                logger.warning(f"Mensaje o número inválido. Texto: '{message_text}', Número: '{from_number}'")
+                return jsonify({'status': 'error', 'message': 'invalid message data'}), 400
+            
+            # Enviar mensaje de "pensando" para consultas que pueden tardar
+            if len(message_text) > 20:  # Para mensajes más largos o complejos
+                thinking_msg = "Un momento, estoy buscando esa información para ti... ⏳"
+                send_whatsapp_message(from_number, thinking_msg)
+                logger.info(f"Mensaje de 'pensando' enviado a {from_number}")
+            
+            # Generar respuesta con Gemini
+            conversation_history = load_conversation_history(from_number)
+            bot_response = get_gemini_response(message_text, conversation_history)
+            
+            # Dividir mensaje si es muy largo
+            message_parts = split_message(bot_response)
+            
+            # Enviar respuesta(s)
+            for part in message_parts:
+                success = send_whatsapp_message(from_number, part)
+                if success:
+                    logger.info(f"Respuesta enviada a {from_number}")
+                else:
+                    logger.error(f"Error enviando respuesta a {from_number}")
+            
+            # Guardar conversación
+            conversation_manager.add_exchange(from_number, message_text, bot_response)
+            
+            return jsonify({'status': 'success', 'message': 'processed'}), 200
+
+        # 3) Para otros eventos, responder 200
+        logger.info(f"Evento ignorado: {event}")
+        return jsonify({'status': 'ignored', 'event': event}), 200
+
+    except Exception:
+        # Loggea y responde controlado
+        logger.exception("webhook error (minimal)")
         return jsonify({'status': 'error', 'message': 'Internal server error'}), 500
-
 @app.route('/status', methods=['GET'])
 def status():
     """Get status information about the service."""
@@ -574,6 +621,22 @@ def clear_history(user_id):
         logger.error(f"Error clearing history for {user_id}: {e}")
         return jsonify({'status': 'error', 'message': 'Internal server error'}), 500
 
+@app.route('/', methods=['GET', 'POST'])
+def root():
+    """Handle requests to root path - redirect to proper endpoints."""
+    if request.method == 'GET':
+        return jsonify({
+            'message': 'WhatsApp Chatbot API is running',
+            'endpoints': {
+                '/webhook': 'POST - WhatsApp webhook',
+                '/health': 'GET - Health check',
+                '/status': 'GET - Service status'
+            }
+        }), 200
+    elif request.method == 'POST':
+        # Si recibe POST en /, redirigir a webhook
+        return webhook()
+
 if __name__ == '__main__':
     # Display startup information
     logger.info("======================================================")
@@ -589,6 +652,6 @@ if __name__ == '__main__':
     
     # For development with webhook testing via ngrok
     port = int(os.getenv('PORT', '5001'))
-    debug = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
+    debug = os.getenv('FLASK_DEBUG', 'True').lower() == 'true'
     load_rag_index()  # <=== NUEVO
     app.run(debug=debug, port=port, host='0.0.0.0')
