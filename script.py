@@ -46,6 +46,10 @@ def embed_query(q: str) -> np.ndarray:
     return v.reshape(1, -1)
 
 def retrieve_context(query: str, k: int = 5) -> str:
+    # Usar más chunks para preguntas complejas
+    complex_keywords = ['procedimiento', 'proceso', 'pasos', 'cómo', 'protocolo', 'guía']
+    if any(word in query.lower() for word in complex_keywords):
+        k = 4  # Más contexto para preguntas complejas
     if faiss_index is None or docstore is None:
         return ""
     qv = embed_query(query)
@@ -58,7 +62,9 @@ def retrieve_context(query: str, k: int = 5) -> str:
         # Formato más humano para el contexto interno
         filename = item['file'].replace('.pdf', '').replace('-', ' ')
         page = item.get('page', '?')
-        parts.append(f"Documento: {filename}, página {page}\nContenido: {item['text']}")
+        # Limitar texto a 800 caracteres para acelerar respuesta
+        text_content = item['text'][:800] + "..." if len(item['text']) > 800 else item['text']
+        parts.append(f"Documento: {filename}, página {page}\nContenido: {text_content}")
     return "\n\n---\n\n".join(parts)
 
 
@@ -347,31 +353,32 @@ class GeminiClient:
             return "Sorry, I'm having trouble connecting to my brain right now (API key issue)."
 
         try:
-            retrieved = retrieve_context(message_text, k=5)
+            retrieved = retrieve_context(message_text, k=3)  # Usar valor optimizado
             
             # Si no hay contexto relevante, respuesta estricta con sugerencias
             if not retrieved.strip():
                 return ("Lo siento, no tengo esa información en mi base de datos. "
-                       "Puedo ayudarte con cosas como: información sobre el menú semanal día a día, "
-                       "desayunos, comidas y cenas para cada día de la semana. "
-                       "¿Te gustaría saber algo sobre el menú?")
+                       "Puedo ayudarte con información sobre: protocolos de seguridad de CEMEX, "
+                       "investigación y reporte de incidentes fatales, guías de seguridad corporativa. "
+                       "¿Te gustaría saber algo sobre estos temas?")
             
             rag_guardrails = (
                 "INSTRUCCIONES ESTRICTAS:\n"
                 "1. SIEMPRE empieza tu respuesta mencionando la fuente: 'Según el documento [nombre-archivo] en la página [X]:'\n"
                 "2. Responde ÚNICAMENTE con información del contexto documental provisto\n"
-                "3. Si la pregunta NO se puede responder con el contexto, responde: 'Lo siento, no tengo esa información en mi base de datos. Puedo ayudarte con información sobre el menú semanal día a día, desayunos, comidas y cenas para cada día de la semana. ¿Te gustaría saber algo sobre el menú?'\n"
+                "3. Si la pregunta NO se puede responder con el contexto, responde: 'Lo siento, no tengo esa información en mi base de datos. Puedo ayudarte con información sobre protocolos de seguridad de CEMEX, investigación y reporte de incidentes fatales, guías de seguridad corporativa. ¿Te gustaría saber algo sobre estos temas?'\n"
                 "4. NO incluyas referencias técnicas como [chunk X] - hazlo conversacional\n"
                 "5. Sé amigable y útil, como un asistente humano\n"
-            
-                "6. No inventes información ni detalles no presentes en el contexto\n"
-                "7. Contesta en UN solo mensaje, no dividas la respuesta en múltiples mensajes\n"
-                "8. FORMATO OBLIGATORIO: Siempre inicia con la referencia del documento y página\n\n"
+                "6. Da respuesta COMPLETA en UN SOLO MENSAJE - no dividas la información\n"
+                "7. No inventes información ni detalles no presentes en el contexto\n"
+                "8. NO uses caracteres de formato como \\n, \\t o similares - usa texto normal\n"
+                "9. Para saltos de línea usa espacios o puntos, NO caracteres especiales\n"
+                "10. FORMATO OBLIGATORIO: Siempre inicia con la referencia del documento y página\n\n"
                 f"Contexto documental disponible:\n{retrieved}\n\n"
                 "EJEMPLO de respuesta correcta:\n"
-                "'Según el documento menú-semanal-día-a-día en la página 3: El desayuno del lunes incluye...'\n"
-                "Responde siguiendo este formato SIEMPRE."
-                "9. Inmediatemente al recibir el mensaje de un usuario envia un mensaje de espera si el mensaje es largo o complejo (más de 20 caracteres)"
+                "'Según el documento CEMEX Safety Reporting Guidelines en la página 5: Los incidentes fatales deben reportarse inmediatamente. Los casos incluyen fracturas graves y lesiones que requieren hospitalización.'\n"
+                "FORMATO DE TEXTO: Usa texto normal, sin caracteres especiales como \\n o \\t.\n"
+                "Responde siguiendo este formato SIEMPRE, con información completa en un solo mensaje."
             )
             # Create model with system instruction for persona
             model = genai.GenerativeModel(
@@ -551,15 +558,17 @@ def webhook():
                 logger.warning(f"Mensaje o número inválido. Texto: '{message_text}', Número: '{from_number}'")
                 return jsonify({'status': 'error', 'message': 'invalid message data'}), 400
             
-            # Enviar mensaje de "pensando" para consultas que pueden tardar
-            if len(message_text) > 20:  # Para mensajes más largos o complejos
-                thinking_msg = "Un momento, estoy buscando esa información para ti... ⏳"
-                send_whatsapp_message(from_number, thinking_msg)
-                logger.info(f"Mensaje de 'pensando' enviado a {from_number}")
+            # Enviar mensaje de "pensando" SIEMPRE para dar feedback inmediato
+            thinking_msg = "Un momento, estoy procesando tu consulta... ⏳"
+            send_whatsapp_message(from_number, thinking_msg)
+            logger.info(f"Mensaje de 'pensando' enviado a {from_number}")
             
             # Generar respuesta con Gemini
             conversation_history = load_conversation_history(from_number)
             bot_response = get_gemini_response(message_text, conversation_history)
+            
+            # Limpiar caracteres de formato no deseados
+            bot_response = bot_response.replace('\\n', '\n').replace('\\t', ' ').strip()
             
             # Dividir mensaje si es muy largo
             message_parts = split_message(bot_response)
